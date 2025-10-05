@@ -1,0 +1,37 @@
+{
+  "target": "http://127.0.0.1:5000",
+  "pages_scanned": 2,
+  "forms": [
+    {
+      "page": "http://127.0.0.1:5000",
+      "action": "http://127.0.0.1:5000/search",
+      "method": "get",
+      "inputs": [
+        {
+          "name": "q",
+          "type": "text",
+          "value": ""
+        }
+      ],
+      "xss_check": {
+        "ok": true,
+        "reflected": true,
+        "status_code": 200
+      }
+    }
+  ],
+  "sqli_findings": [],
+  "xss_findings": [
+    {
+      "page": "http://127.0.0.1:5000",
+      "action": "http://127.0.0.1:5000/search",
+      "method": "get",
+      "details": "marker reflected in response"
+    },
+    {
+      "page": "http://127.0.0.1:5000/search?q=hello",
+      "param": "q",
+      "details": "marker reflected in response (query param)"
+    }
+  ]
+}

@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+vuln_scanner.py
+Simple, non-destructive web application vulnerability scanner for educational/testing use only.
+
+Features:
+- Limited crawler (same domain)
+- Form extraction and submission
+- Reflected XSS detection (marker reflection)
+- Basic SQLi indicator detection (response error messages)
+- Rate limiting and polite measures
+
+Usage: python vuln_scanner.py https://target.example
+"""
+
+import sys
+import re
+import time
+import json
+import argparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+import requests
+from bs4 import BeautifulSoup
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+HEADERS = {"User-Agent": "Codtech-VulnScanner/1.0 (+https://codtech.example)"}  # change if desired
+REQUEST_TIMEOUT = 10
+SLEEP_BETWEEN_REQUESTS = 0.8
+MAX_PAGES = 50  # limit crawling to avoid aggressive scanning
+VERBOSE = True
+
+# Marker/payloads (non-destructive)
+XSS_MARKER = "XSS_TEST_MARKER_12345"
+SQLI_PAYLOADS = ["'", "\"", "' OR '1'='1", "\" OR \"1\"=\"1"]  # harmless, checks for error messages or anomalies
+
+# Common SQL error signatures (not exhaustive)
+SQL_ERRORS = [
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark after the character string",
+    "quoted string not properly terminated",
+    "pg::syntaxerror",
+    "sqlstate",
+    "mysql_fetch",
+    "syntax error at or near"
+]
+
+# ---------------------------
+# UTIL
+# ---------------------------
+def log(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
+
+def same_domain(base, url):
+    return urlparse(base).netloc == urlparse(url).netloc
+
+# ---------------------------
+# CRAWLER
+# ---------------------------
+def get_links(session, base_url, html):
+    soup = BeautifulSoup(html, "lxml")
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("javascript:") or href.startswith("#"):
+            continue
+        full = urljoin(base_url, href)
+        if same_domain(base_url, full):
+            links.add(full.split("#")[0])
+    return links
+
+# ---------------------------
+# FORM PARSING & TESTING
+# ---------------------------
+def extract_forms(html, base_url):
+    soup = BeautifulSoup(html, "lxml")
+    forms = []
+    for form in soup.find_all("form"):
+        f = {}
+        f['action'] = urljoin(base_url, form.get('action') or "")
+        f['method'] = (form.get('method') or "get").lower()
+        inputs = []
+        for inp in form.find_all(["input", "textarea", "select"]):
+            name = inp.get('name')
+            if not name:
+                continue
+            typ = inp.get('type', 'text')
+            # default value if any
+            val = inp.get('value') or ""
+            inputs.append({'name': name, 'type': typ, 'value': val})
+        f['inputs'] = inputs
+        forms.append(f)
+    return forms
+
+def check_reflected_xss(session, form, url):
+    """
+    Submits the form with XSS_MARKER in text fields and checks whether marker appears
+    in the returned HTML. This is a *reflection detection* only and DOES NOT execute JS.
+    """
+    # prepare data
+    data = {}
+    for i in form['inputs']:
+        if i['type'] in ['text', 'search', 'email', 'textarea', 'url', 'tel', 'password']:
+            data[i['name']] = XSS_MARKER
+        else:
+            data[i['name']] = i.get('value', '') or '1'  # safe default
+    try:
+        if form['method'] == 'post':
+            res = session.post(form['action'] or url, data=data, timeout=REQUEST_TIMEOUT)
+        else:
+            res = session.get(form['action'] or url, params=data, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+    reflected = XSS_MARKER in res.text
+    return {'ok': True, 'reflected': reflected, 'status_code': res.status_code}
+
+def check_sqli_indicators(session, target_url, params=None):
+    """
+    For a given URL (and optional params), append small SQL-like payloads and
+    check responses for common SQL error signatures.
+    """
+    findings = []
+    base_params = params or {}
+    for payload in SQLI_PAYLOADS:
+        try:
+            # construct request: if params given, add to them; else add to querystring with param name "q_test"
+            if base_params:
+                test_params = base_params.copy()
+                # inject payload into each param one by one (cheap but informative)
+                for name in list(test_params.keys()):
+                    original = test_params[name]
+                    test_params[name] = str(original) + payload
+                    r = session.get(target_url, params=test_params, timeout=REQUEST_TIMEOUT)
+                    text = r.text.lower()
+                    for sig in SQL_ERRORS:
+                        if sig in text:
+                            findings.append({'payload': payload, 'param': name, 'signature': sig, 'url': r.url, 'status': r.status_code})
+                    test_params[name] = original  # restore
+            else:
+                # no params: add a single param q_test
+                test_params = {'q_test': payload}
+                r = session.get(target_url, params=test_params, timeout=REQUEST_TIMEOUT)
+                text = r.text.lower()
+                for sig in SQL_ERRORS:
+                    if sig in text:
+                        findings.append({'payload': payload, 'param': 'q_test', 'signature': sig, 'url': r.url, 'status': r.status_code})
+        except Exception as e:
+            findings.append({'payload': payload, 'error': str(e)})
+    return findings
+
+# ---------------------------
+# MAIN SCAN ROUTINES
+# ---------------------------
+def scan_target(start_url, max_pages=MAX_PAGES):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    to_visit = [start_url]
+    visited = set()
+    results = {'target': start_url, 'pages_scanned': 0, 'forms': [], 'sqli_findings': [], 'xss_findings': []}
+
+    while to_visit and len(visited) < max_pages:
+        url = to_visit.pop(0)
+        if url in visited:
+            continue
+        log(f"[+] Fetching: {url}")
+        try:
+            r = session.get(url, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            log(f"    [!] Request failed: {e}")
+            visited.add(url)
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            continue
+
+        visited.add(url)
+        results['pages_scanned'] += 1
+        html = r.text
+
+        # extract and queue links
+        links = get_links(start_url, html)
+        for l in links:
+            if l not in visited and l not in to_visit:
+                to_visit.append(l)
+
+        # extract forms and test them
+        forms = extract_forms(html, url)
+        for f in forms:
+            f_rec = {'page': url, 'action': f['action'], 'method': f['method'], 'inputs': f['inputs']}
+            # check reflected XSS
+            xss_res = check_reflected_xss(session, f, url)
+            if xss_res.get('ok') and xss_res.get('reflected'):
+                log(f"    [!] Possible reflected XSS on form at {url} -> action {f['action']}")
+                results['xss_findings'].append({'page': url, 'action': f['action'], 'method': f['method'], 'details': 'marker reflected in response'})
+            f_rec['xss_check'] = xss_res
+
+            # attempt sqli indicators by submitting with SQL-like payloads (only in GET requests we also test link params below)
+            # For safety we only add to findings if error patterns are observed
+            sqli_res = check_sqli_indicators(session, f['action'] or url, params={i['name']: i.get('value', '') for i in f['inputs']})
+            if sqli_res:
+                log(f"    [!] SQLi-like signatures found on form action {f['action']}: {sqli_res}")
+                results['sqli_findings'].extend([{'page': url, 'action': f['action'], 'e': e} for e in sqli_res])
+
+            results['forms'].append(f_rec)
+
+        # Also test query parameters in URL for possible reflection / sqli indicators
+        parsed = urlparse(url)
+        if parsed.query:
+            params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
+            if params:
+                # test reflection of XSS_MARKER in page by requesting with marker appended to each param
+                for p in params.keys():
+                    test_params = params.copy()
+                    test_params[p] = test_params[p] + XSS_MARKER
+                    try:
+                        r2 = session.get(parsed._replace(query="").geturl(), params=test_params, timeout=REQUEST_TIMEOUT)
+                        if XSS_MARKER in r2.text:
+                            log(f"    [!] Possible reflected XSS via query param `{p}` on {url}")
+                            results['xss_findings'].append({'page': url, 'param': p, 'details': 'marker reflected in response (query param)'})
+                    except Exception as e:
+                        log("    [!] Error testing query param reflection:", e)
+
+                # test for SQL errors via query params
+                sqli_q = check_sqli_indicators(session, parsed._replace(query="").geturl(), params=params)
+                if sqli_q:
+                    log(f"    [!] SQLi-like signatures found in query params on {url}: {sqli_q}")
+                    results['sqli_findings'].extend([{'page': url, 'param_test': p} for p in sqli_q])
+
+        # polite sleep
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    return results
+
+# ---------------------------
+# CLI
+# ---------------------------
+def main():
+    global VERBOSE, MAX_PAGES
+
+    parser = argparse.ArgumentParser(description="Simple Web App Vulnerability Scanner (educational only).")
+    parser.add_argument("target", help="Target base URL (e.g. https://example.com)")
+    parser.add_argument("--limit", type=int, default=MAX_PAGES, help="Max pages to crawl (default {})".format(MAX_PAGES))
+    parser.add_argument("--nogui", action="store_true", help="Run quietly (minimal output)")
+    parser.add_argument("--out", help="Save JSON report to file")
+    args = parser.parse_args()
+
+    if args.nogui:
+        VERBOSE = False
+    MAX_PAGES = args.limit
+
+    # Basic validation
+    if not args.target.startswith("http"):
+        print("Please provide a full URL (include http:// or https://).")
+        sys.exit(1)
+
+    # quick reminder (ethics)
+    print("=== Codtech Vulnerability Scanner (educational use only) ===")
+    print("Make sure you have explicit permission to test the target. Scanning without permission is illegal.")
+    print()
+
+    res = scan_target(args.target, max_pages=MAX_PAGES)
+
+    # Print short summary
+    print("\n--- Scan summary ---")
+    print("Target:", res['target'])
+    print("Pages scanned:", res['pages_scanned'])
+    print("Forms found:", len(res['forms']))
+    print("Possible reflected XSS findings:", len(res['xss_findings']))
+    print("Possible SQLi indicator findings:", len(res['sqli_findings']))
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(res, f, indent=2)
+        print("Report saved to", args.out)
+    else:
+        # pretty print results (brief)
+        if res['xss_findings']:
+            print("\nReflected XSS findings (brief):")
+            for f in res['xss_findings']:
+                print(" -", f)
+        if res['sqli_findings']:
+            print("\nSQLi indicator findings (brief):")
+            for e in res['sqli_findings']:
+                print(" -", e)
+
