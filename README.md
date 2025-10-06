@@ -47,7 +47,7 @@ SQL Injection (SQLi) Detection:
 The tool appends special characters like ', ", or -- to input parameters and observes the response for error patterns related to SQL databases, such as syntax or query errors. These patterns signal possible SQL injection points.
 
 Reporting Results
-Once scanning is complete, the findings are saved into a report.json file. This report includes:
+Once scanning is complete, the findings are saved into a report.json file. This report includes: 
 
 The target URL
 
